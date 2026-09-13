@@ -53,6 +53,7 @@ def _scraper_url(target_url: str) -> str:
         "country_code": "ru",
         "device_type": "desktop",
         "keep_headers": "true",
+        "render": "true",
     })
     return f"https://api.scraperapi.com/?{params}"
 
