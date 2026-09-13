@@ -54,6 +54,7 @@ def _scraper_url(target_url: str) -> str:
         "device_type": "desktop",
         "keep_headers": "true",
         "render": "true",
+        "premium": "true",
     })
     return f"https://api.scraperapi.com/?{params}"
 
