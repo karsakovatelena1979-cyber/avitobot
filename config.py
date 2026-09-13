@@ -40,3 +40,4 @@ INVOICE_PAYLOAD: str = "subscription_1_month"
 # UX
 CHECK_PROCESSING_MIN: float = 1.0
 CHECK_PROCESSING_MAX: float = 3.0
+FREE_DAILY_CHECKS: int = 3
