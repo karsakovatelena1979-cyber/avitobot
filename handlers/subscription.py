@@ -66,8 +66,6 @@ async def _show_subscribe(message: Message) -> None:
     await message.answer(SUBSCRIBE_TEXT, reply_markup=subscribe_keyboard())
 
 
-# === ЗАГЛУШКИ ===
-
 @router.callback_query(F.data == "pay_sbp")
 async def cb_pay_sbp(callback: CallbackQuery) -> None:
     await callback.message.edit_text(SUBSCRIBE_STUB_SBP, reply_markup=subscribe_keyboard())
@@ -80,16 +78,11 @@ async def cb_pay_crypto(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
-# === TELEGRAM STARS ===
-
 @router.callback_query(F.data == "pay_stars")
 async def cb_pay_stars(callback: CallbackQuery) -> None:
     """Показывает кнопку оплаты Stars."""
     await callback.message.edit_text(
-        f"⭐ Оплата Telegram Stars
-
-"
-        f"Подписка на {SUBSCRIPTION_MONTHS} мес — {SUBSCRIPTION_PRICE_STARS} Stars",
+        f"⭐ Оплата Telegram Stars\n\nПодписка на {SUBSCRIPTION_MONTHS} мес — {SUBSCRIPTION_PRICE_STARS} Stars",
         reply_markup=pay_stars_keyboard(),
     )
     await callback.answer()
@@ -122,9 +115,7 @@ async def successful_payment(message: Message) -> None:
     user_id = message.from_user.id
 
     try:
-        # Активируем подписку
         expiry = await database.activate_subscription(user_id, SUBSCRIPTION_MONTHS)
-        # Записываем платёж
         await database.add_payment(
             user_id=user_id,
             amount=payment.total_amount,
@@ -138,16 +129,11 @@ async def successful_payment(message: Message) -> None:
         )
         logger.info("Подписка активирована: user_id=%s до %s", user_id, date_str)
 
-        # Уведомление админу
         if ADMIN_ID:
             try:
                 await message.bot.send_message(
                     ADMIN_ID,
-                    f"💰 Новая продажа!
-"
-                    f"Пользователь: {user_id} (@{message.from_user.username or 'нет'})
-"
-                    f"Сумма: {payment.total_amount} Stars",
+                    f"💰 Новая продажа!\nПользователь: {user_id} (@{message.from_user.username or 'нет'})\nСумма: {payment.total_amount} Stars",
                 )
             except Exception as e:
                 logger.warning("Не удалось уведомить админа: %s", e)
