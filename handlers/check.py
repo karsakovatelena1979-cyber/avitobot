@@ -30,7 +30,6 @@ router = Router()
 
 
 def _format_verdict(verdict: str) -> str:
-    """Добавляет эмодзи к вердикту."""
     text = verdict.strip()
     upper = text.upper()
     if "БРАТЬ" in upper and "БЕЖАТЬ" not in upper:
@@ -47,58 +46,66 @@ def _format_verdict(verdict: str) -> str:
 
 @router.message(lambda m: m.text and "avito.ru" in m.text)
 async def check_listing(message: Message) -> None:
-    """Принимает ссылку на Авито, парсит, отправляет в AI, возвращает вердикт."""
     url = message.text.strip()
 
     if not is_avito_url(url):
         await message.answer(CHECK_ERROR_NOT_AVITO)
         return
 
-    # Сообщение о процессе
     processing_msg = await message.answer(CHECK_PROCESSING)
 
     try:
         listing = await parse_avito(url)
-    except AvitoBlockedError:
+    except AvitoBlockedError as e:
+        logger.warning("Авито заблокировал: %s", e)
         await processing_msg.edit_text(CHECK_ERROR_BLOCKED)
         return
-    except AvitoNotFoundError:
+    except AvitoNotFoundError as e:
+        logger.warning("Объявление не найдено: %s", e)
         await processing_msg.edit_text(CHECK_ERROR_NOT_FOUND)
         return
     except Exception as e:
         logger.exception("Ошибка парсинга: %s", e)
-        await processing_msg.edit_text(CHECK_ERROR_GENERIC)
+        await processing_msg.edit_text(
+            f"😔 Не смог загрузить объявление.\n\n"
+            f"Причина: <code>{type(e).__name__}: {str(e)[:200]}</code>\n\n"
+            f"Попробуй через минуту или скинь текст объявления вручную."
+        )
         return
 
-    # Если заголовок пустой — скорее всего парсинг не удался
     if not listing.title:
-        logger.error("Парсинг не дал результата для %s", url)
-        await processing_msg.edit_text(CHECK_ERROR_GENERIC)
+        logger.error("Пустой заголовок для %s", url)
+        await processing_msg.edit_text(
+            "🤔 Загрузил страницу, но не смог прочитать объявление.\n\n"
+            "Скорее всего Авито показал капчу или изменил вёрстку.\n\n"
+            "Скинь текст объявления вручную — название, цену и описание."
+        )
         return
 
-    # Небольшая пауза для UX (чтобы пользователь видел процесс)
     wait_time = random.uniform(CHECK_PROCESSING_MIN, CHECK_PROCESSING_MAX) / 2
     await asyncio.sleep(wait_time)
 
     try:
         verdict = await analyze_listing(listing)
-    except AIError:
-        await processing_msg.edit_text(CHECK_ERROR_AI)
+    except AIError as e:
+        logger.error("Ошибка AI: %s", e)
+        await processing_msg.edit_text(
+            f"🛌 Объявление прочитал, но AI не ответил.\n\n"
+            f"Причина: <code>{str(e)[:200]}</code>\n\n"
+            f"Попробуй через пару минут."
+        )
         return
     except Exception as e:
-        logger.exception("Ошибка AI: %s", e)
+        logger.exception("Неизвестная ошибка AI: %s", e)
         await processing_msg.edit_text(CHECK_ERROR_AI)
         return
 
-    # Увеличиваем счётчик проверок
     await database.increment_checks(message.from_user.id)
-
     formatted = _format_verdict(verdict)
-    await processing_msg.edit_text(formatted)
+    await processing_msg.edit_text(formatted, parse_mode="HTML")
     logger.info("Вердикт отправлен user_id=%s", message.from_user.id)
 
 
 @router.message(lambda m: m.text and m.text.startswith("http"))
 async def wrong_link(message: Message) -> None:
-    """Ссылка есть, но не Авито."""
     await message.answer(CHECK_ERROR_NOT_AVITO)
