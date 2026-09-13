@@ -1,0 +1,18 @@
+services:
+  - type: worker
+    name: avitobot
+    runtime: docker
+    plan: starter
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: DATABASE_PATH
+        value: /data/bot.db
+    disk:
+      name: bot-data
+      mountPath: /data
+      sizeGB: 1

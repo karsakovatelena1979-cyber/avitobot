@@ -1,0 +1,10 @@
+[build]
+builder = "dockerfile"
+
+[deploy]
+startCommand = "python bot.py"
+restartPolicyType = "on-failure"
+
+[[volumes]]
+mountPath = "/data"
+name = "bot-data"
