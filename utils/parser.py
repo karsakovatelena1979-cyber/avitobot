@@ -1,4 +1,4 @@
-"""Парсинг объявлений Авито: httpx + BeautifulSoup."""
+"""Парсинг Авито через несколько методов с fallback."""
 
 import asyncio
 import base64
@@ -7,63 +7,21 @@ import logging
 import random
 import re
 from dataclasses import dataclass, field
+from urllib.parse import urlparse, urlencode, parse_qs, urlunparse
 
 import httpx
 from bs4 import BeautifulSoup
 
-from config import (
-    MAX_PHOTOS,
-    PARSER_DELAY_MAX,
-    PARSER_DELAY_MIN,
-    PARSER_TIMEOUT,
-)
+from config import MAX_PHOTOS, PARSER_TIMEOUT
 
 logger = logging.getLogger(__name__)
 
-FALLBACK_USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:125.0) Gecko/20100101 Firefox/125.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 OPR/110.0.0.0",
-    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:126.0) Gecko/20100101 Firefox/126.0",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
-    "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+MOBILE_USER_AGENTS = [
+    "Mozilla/5.0 (Linux; Android 13; SM-A536B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 12; Redmi Note 11) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
 ]
-
-
-def _get_headers(ua: str) -> dict:
-    return {
-        "User-Agent": ua,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Referer": "https://www.avito.ru/",
-        "DNT": "1",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Ch-Ua": '"Chromium";v="125", "Google Chrome";v="125"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"Windows"',
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Cache-Control": "max-age=0",
-    }
-
-
-def _get_cookies() -> dict:
-    """Базовые куки чтобы выглядеть как браузер."""
-    return {
-        "u": f"{random.randint(10000000, 99999999)}.{random.randint(1000000000, 9999999999)}",
-        "v": "2",
-        "abp": "1",
-    }
 
 
 class AvitoBlockedError(Exception):
@@ -87,172 +45,162 @@ class AvitoListing:
 
 
 def is_avito_url(text: str) -> bool:
-    pattern = r"https?://(www\.)?avito\.ru/"
-    return bool(re.search(pattern, text.strip()))
+    return bool(re.search(r"https?://(www\.)?avito\.ru/", text.strip()))
 
 
 def _clean_url(url: str) -> str:
-    """Убираем UTM-метки — они иногда триггерят защиту."""
-    return url.split("?")[0]
+    """Убираем UTM и лишние параметры."""
+    parsed = urlparse(url)
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
 
 
-async def _download_photo(client: httpx.AsyncClient, url: str) -> str | None:
+def _extract_item_id(url: str) -> str | None:
+    """Извлекаем ID объявления из URL."""
+    match = re.search(r"_(\d{7,12})(?:\?|$|/)", url)
+    return match.group(1) if match else None
+
+
+async def _try_api(item_id: str) -> AvitoListing | None:
+    """Пробуем неофициальный API Авито."""
+    api_url = f"https://api.avito.ru/core/v1/items/{item_id}/"
+    headers = {
+        "User-Agent": random.choice(MOBILE_USER_AGENTS),
+        "Accept": "application/json",
+        "Origin": "https://www.avito.ru",
+        "Referer": "https://www.avito.ru/",
+    }
     try:
-        resp = await client.get(url, timeout=10, follow_redirects=True)
-        resp.raise_for_status()
-        return base64.b64encode(resp.content).decode("utf-8")
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            resp = await client.get(api_url, headers=headers)
+            if resp.status_code != 200:
+                logger.info("API вернул %d", resp.status_code)
+                return None
+            data = resp.json()
+            listing = AvitoListing()
+            listing.title = data.get("title", "")
+            listing.price = str(data.get("priceDetailed", {}).get("value", "")) + " ₽"
+            listing.description = data.get("description", "")
+            listing.category = data.get("category", {}).get("name", "")
+            images = data.get("images", [])
+            listing.photos = [img.get("864x864", img.get("640x480", "")) for img in images[:MAX_PHOTOS]]
+            return listing
     except Exception as e:
-        logger.warning("Не удалось скачать фото %s: %s", url, e)
+        logger.warning("API метод не сработал: %s", e)
         return None
 
 
-def _parse_html(soup: BeautifulSoup, url: str) -> AvitoListing:
-    listing = AvitoListing(url=url)
+async def _try_mobile_web(url: str) -> AvitoListing | None:
+    """Парсим мобильную версию — она легче защищена."""
+    mobile_url = url.replace("www.avito.ru", "m.avito.ru")
+    ua = random.choice(MOBILE_USER_AGENTS)
+    headers = {
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ru-RU,ru;q=0.9",
+        "Referer": "https://m.avito.ru/",
+    }
+    try:
+        await asyncio.sleep(random.uniform(3, 7))
+        async with httpx.AsyncClient(
+            headers=headers,
+            timeout=PARSER_TIMEOUT,
+            follow_redirects=True,
+        ) as client:
+            resp = await client.get(mobile_url)
+            if resp.status_code in (429, 403):
+                logger.warning("Мобильная версия вернула %d", resp.status_code)
+                return None
+            if resp.status_code == 404:
+                raise AvitoNotFoundError("404")
+            resp.raise_for_status()
 
-    # Заголовок
-    title_tag = (
-        soup.find("h1", {"data-marker": "item-view/title-info"}) or
-        soup.find("h1", class_=re.compile(r"title")) or
-        soup.find("h1")
-    )
-    if title_tag:
-        listing.title = title_tag.get_text(strip=True)
+            if "captcha" in resp.text.lower() and "Подтвердите" in resp.text:
+                return None
 
-    # Цена
-    price_tag = (
-        soup.find("span", {"data-marker": "item-view/item-price"}) or
-        soup.find("span", class_=re.compile(r"price"))
-    )
-    if price_tag:
-        listing.price = price_tag.get_text(strip=True)
-    if not listing.price:
-        meta_price = soup.find("meta", {"itemprop": "price"})
-        if meta_price:
-            listing.price = meta_price.get("content", "")
+            soup = BeautifulSoup(resp.text, "lxml")
+            listing = AvitoListing(url=url)
 
-    # Описание
-    desc_tag = (
-        soup.find("div", {"data-marker": "item-view/item-description"}) or
-        soup.find("div", class_=re.compile(r"item-description"))
-    )
-    if desc_tag:
-        listing.description = desc_tag.get_text(strip=True)
+            h1 = soup.find("h1")
+            if h1:
+                listing.title = h1.get_text(strip=True)
 
-    # Категория из хлебных крошек
-    breadcrumbs = soup.find_all("a", {"data-marker": "breadcrumbs/link"})
-    if breadcrumbs:
-        listing.category = " / ".join(bc.get_text(strip=True) for bc in breadcrumbs)
-    elif len(url.split("/")) > 4:
-        listing.category = url.split("/")[3].replace("_", " ")
+            for sel in [
+                {"data-marker": "item-view/item-price"},
+                {"class": re.compile(r"price")},
+            ]:
+                tag = soup.find("span", sel)
+                if tag:
+                    listing.price = tag.get_text(strip=True)
+                    break
+            if not listing.price:
+                meta = soup.find("meta", {"itemprop": "price"})
+                if meta:
+                    listing.price = meta.get("content", "")
 
-    # Состояние
-    for param in soup.find_all("li", {"data-marker": "item-view/item-params-list/item"}):
-        text = param.get_text(strip=True)
-        if "состояние" in text.lower():
-            listing.condition = text
-            break
-    if not listing.condition:
-        for li in soup.find_all("li"):
-            t = li.get_text(strip=True)
-            if re.search(r"(новый|б/у|бу|хорошее|отличное|требует)", t, re.I):
-                listing.condition = t
-                break
+            for sel in [
+                {"data-marker": "item-view/item-description"},
+                {"class": re.compile(r"description")},
+            ]:
+                tag = soup.find("div", sel)
+                if tag:
+                    listing.description = tag.get_text(strip=True)
+                    break
 
-    # Фото
-    photo_urls = []
-    og_img = soup.find("meta", {"property": "og:image"})
-    if og_img and og_img.get("content"):
-        photo_urls.append(og_img["content"])
+            og_img = soup.find("meta", {"property": "og:image"})
+            if og_img and og_img.get("content"):
+                listing.photos.append(og_img["content"])
 
-    for script in soup.find_all("script", {"type": "application/ld+json"}):
-        try:
-            data = json.loads(script.string or "")
-            if isinstance(data, dict):
-                images = data.get("image", [])
-                if isinstance(images, str):
-                    images = [images]
-                for img_url in images:
-                    if img_url not in photo_urls:
-                        photo_urls.append(img_url)
-                    if len(photo_urls) >= MAX_PHOTOS:
-                        break
-        except Exception:
-            continue
+            if listing.title:
+                return listing
+            return None
+    except AvitoNotFoundError:
+        raise
+    except Exception as e:
+        logger.warning("Мобильный парсинг не сработал: %s", e)
+        return None
 
-    if len(photo_urls) < MAX_PHOTOS:
-        for img in soup.find_all("img"):
-            src = img.get("src") or img.get("data-src") or ""
-            if src and any(x in src for x in [".jpg", ".jpeg", ".png", ".webp"]):
-                if "avito" in src and src not in photo_urls:
-                    photo_urls.append(src)
-            if len(photo_urls) >= MAX_PHOTOS:
-                break
 
-    listing.photos = photo_urls[:MAX_PHOTOS]
-    return listing
+async def _download_photo(url: str) -> str | None:
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            return base64.b64encode(resp.content).decode("utf-8")
+    except Exception as e:
+        logger.warning("Фото не скачалось: %s", e)
+        return None
 
 
 async def parse_avito(url: str) -> AvitoListing:
-    """Парсит объявление. Retry до 3 раз при 429."""
+    """Парсит объявление: сначала API, потом мобильная версия."""
     clean_url = _clean_url(url)
-    max_retries = 3
+    item_id = _extract_item_id(url)
 
-    for attempt in range(1, max_retries + 1):
-        ua = random.choice(FALLBACK_USER_AGENTS)
-        delay = random.uniform(PARSER_DELAY_MIN * attempt, PARSER_DELAY_MAX * attempt)
-        logger.info("Попытка %d/%d, задержка %.1f сек", attempt, max_retries, delay)
-        await asyncio.sleep(delay)
-
-        try:
-            async with httpx.AsyncClient(
-                headers=_get_headers(ua),
-                cookies=_get_cookies(),
-                timeout=PARSER_TIMEOUT,
-                follow_redirects=True,
-            ) as client:
-                resp = await client.get(clean_url)
-
-                if resp.status_code == 429:
-                    wait = 10 * attempt
-                    logger.warning("429 на попытке %d, жду %d сек", attempt, wait)
-                    if attempt == max_retries:
-                        raise AvitoBlockedError(f"429 после {max_retries} попыток")
-                    await asyncio.sleep(wait)
-                    continue
-
-                if resp.status_code == 403:
-                    raise AvitoBlockedError("403 Forbidden")
-
-                if resp.status_code == 404:
-                    raise AvitoNotFoundError("404 Not Found")
-
-                resp.raise_for_status()
-
-                if "captcha" in resp.text.lower() and "Подтвердите" in resp.text:
-                    raise AvitoBlockedError("captcha detected")
-
-                soup = BeautifulSoup(resp.text, "lxml")
-                listing = _parse_html(soup, url)
-
-                # Скачиваем фото
-                for photo_url in listing.photos:
-                    b64 = await _download_photo(client, photo_url)
+    # Метод 1: неофициальный API
+    if item_id:
+        logger.info("Пробуем API метод, item_id=%s", item_id)
+        listing = await _try_api(item_id)
+        if listing and listing.title:
+            listing.url = url
+            for photo_url in listing.photos:
+                if photo_url:
+                    b64 = await _download_photo(photo_url)
                     if b64:
                         listing.photos_base64.append(b64)
+            logger.info("API метод сработал: %s", listing.title[:50])
+            return listing
 
-                logger.info(
-                    "Парсинг OK: title=%s, price=%s, photos=%d",
-                    listing.title[:50] if listing.title else "?",
-                    listing.price,
-                    len(listing.photos_base64),
-                )
-                return listing
+    # Метод 2: мобильная версия
+    logger.info("Пробуем мобильную версию")
+    listing = await _try_mobile_web(clean_url)
+    if listing and listing.title:
+        for photo_url in listing.photos:
+            if photo_url:
+                b64 = await _download_photo(photo_url)
+                if b64:
+                    listing.photos_base64.append(b64)
+        logger.info("Мобильный метод сработал: %s", listing.title[:50])
+        return listing
 
-        except (AvitoBlockedError, AvitoNotFoundError):
-            raise
-        except Exception as e:
-            logger.warning("Ошибка на попытке %d: %s", attempt, e)
-            if attempt == max_retries:
-                raise
-
-    raise AvitoBlockedError("Все попытки исчерпаны")
+    # Всё заблокировано
+    raise AvitoBlockedError("Авито блокирует запросы с этого сервера. Попробуй скинуть текст объявления вручную.")
