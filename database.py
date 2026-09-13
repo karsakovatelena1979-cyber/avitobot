@@ -1,11 +1,8 @@
-"""Работа с базой данных SQLite через aiosqlite.
-
-КРИТИЧНО: файл БД хранится на PERSISTENT volume (/data/bot.db),
-поэтому данные НЕ сбрасываются при деплое/рестарте.
-"""
+"""База данных SQLite через aiosqlite."""
 
 import logging
-from datetime import datetime, date, timedelta
+import os
+from datetime import date, datetime, timedelta
 
 import aiosqlite
 
@@ -15,28 +12,29 @@ logger = logging.getLogger(__name__)
 
 
 async def init_db() -> None:
-    """Создаёт таблицы если не существуют. НИКОГДА не удаляет данные."""
+    """Создаём таблицы если не существуют. Папку тоже создаём."""
+    os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)
     async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                user_id     INTEGER PRIMARY KEY,
+                username    TEXT,
+                first_name  TEXT,
+                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 is_subscribed INTEGER DEFAULT 0,
                 sub_expires_at TIMESTAMP,
-                checks_today INTEGER DEFAULT 0,
+                checks_today   INTEGER DEFAULT 0,
                 last_check_date DATE
             )
         """)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS payments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                amount INTEGER,
-                method TEXT,
-                paid_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                months INTEGER DEFAULT 1
+                id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id  INTEGER,
+                amount   INTEGER,
+                method   TEXT,
+                paid_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                months   INTEGER DEFAULT 1
             )
         """)
         await db.commit()
@@ -44,95 +42,48 @@ async def init_db() -> None:
 
 
 async def add_user(user_id: int, username: str | None, first_name: str | None) -> None:
-    """Добавляет пользователя если его нет, иначе обновляет имя."""
     async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute("""
-            INSERT INTO users (user_id, username, first_name)
+            INSERT OR IGNORE INTO users (user_id, username, first_name)
             VALUES (?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                username = excluded.username,
-                first_name = excluded.first_name
         """, (user_id, username, first_name))
         await db.commit()
 
 
 async def get_user(user_id: int) -> dict | None:
-    """Возвращает данные пользователя или None."""
     async with aiosqlite.connect(DATABASE_PATH) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT * FROM users WHERE user_id = ?", (user_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
+        async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cur:
+            row = await cur.fetchone()
             return dict(row) if row else None
 
 
-async def reset_daily_checks_if_needed(user_id: int) -> None:
-    """Сбрасывает счётчик проверок если наступил новый день."""
-    today = date.today().isoformat()
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        await db.execute("""
-            UPDATE users
-            SET checks_today = 0, last_check_date = ?
-            WHERE user_id = ? AND last_check_date != ?
-        """, (today, user_id, today))
-        await db.commit()
-
-
-async def increment_checks(user_id: int) -> int:
-    """Увеличивает счётчик проверок за сегодня. Возвращает новое значение."""
-    today = date.today().isoformat()
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        # Если last_check_date не сегодня — сначала сбрасываем
-        await db.execute("""
-            UPDATE users
-            SET checks_today = 0, last_check_date = ?
-            WHERE user_id = ? AND last_check_date != ?
-        """, (today, user_id, today))
-        await db.execute("""
-            UPDATE users
-            SET checks_today = checks_today + 1, last_check_date = ?
-            WHERE user_id = ?
-        """, (today, user_id))
-        await db.commit()
-        async with db.execute(
-            "SELECT checks_today FROM users WHERE user_id = ?", (user_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else 0
+async def is_subscription_active(user_id: int) -> bool:
+    user = await get_user(user_id)
+    if not user or not user["is_subscribed"]:
+        return False
+    if not user["sub_expires_at"]:
+        return False
+    try:
+        expires = datetime.fromisoformat(user["sub_expires_at"])
+        return expires > datetime.utcnow()
+    except (ValueError, TypeError):
+        return False
 
 
 async def activate_subscription(user_id: int, months: int = 1) -> datetime:
-    """Активирует/продлевает подписку. Возвращает дату окончания."""
+    expires = datetime.utcnow() + timedelta(days=30 * months)
     async with aiosqlite.connect(DATABASE_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT sub_expires_at FROM users WHERE user_id = ?", (user_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-
-        now = datetime.now()
-        if row and row["sub_expires_at"]:
-            try:
-                current_expiry = datetime.fromisoformat(row["sub_expires_at"])
-            except (ValueError, TypeError):
-                current_expiry = now
-            base_date = max(current_expiry, now)
-        else:
-            base_date = now
-
-        new_expiry = base_date + timedelta(days=30 * months)
         await db.execute("""
             UPDATE users
             SET is_subscribed = 1, sub_expires_at = ?
             WHERE user_id = ?
-        """, (new_expiry.isoformat(), user_id))
+        """, (expires.isoformat(), user_id))
         await db.commit()
-        return new_expiry
+    return expires
 
 
 async def add_payment(user_id: int, amount: int, method: str, months: int = 1) -> None:
-    """Записывает платёж в историю."""
     async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute("""
             INSERT INTO payments (user_id, amount, method, months)
@@ -141,123 +92,98 @@ async def add_payment(user_id: int, amount: int, method: str, months: int = 1) -
         await db.commit()
 
 
-async def is_subscription_active(user_id: int) -> bool:
-    """Проверяет активна ли подписка."""
+async def reset_daily_checks_if_needed(user_id: int) -> None:
     user = await get_user(user_id)
-    if not user or not user["is_subscribed"]:
-        return False
-    if not user["sub_expires_at"]:
-        return False
-    try:
-        expiry = datetime.fromisoformat(user["sub_expires_at"])
-        return expiry > datetime.now()
-    except (ValueError, TypeError):
-        return False
+    if not user:
+        return
+    today = date.today().isoformat()
+    if user["last_check_date"] != today:
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute("""
+                UPDATE users SET checks_today = 0, last_check_date = ?
+                WHERE user_id = ?
+            """, (today, user_id))
+            await db.commit()
 
 
-# === СТАТИСТИКА ДЛЯ АДМИНКИ ===
-
-async def get_total_users() -> int:
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        async with db.execute("SELECT COUNT(*) FROM users") as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else 0
-
-
-async def get_new_users_today() -> int:
+async def increment_checks(user_id: int) -> None:
     today = date.today().isoformat()
     async with aiosqlite.connect(DATABASE_PATH) as db:
-        async with db.execute(
-            "SELECT COUNT(*) FROM users WHERE date(created_at) = ?", (today,)
-        ) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else 0
+        await db.execute("""
+            UPDATE users
+            SET checks_today = checks_today + 1, last_check_date = ?
+            WHERE user_id = ?
+        """, (today, user_id))
+        await db.commit()
 
 
-async def get_active_subscriptions() -> int:
-    now = datetime.now().isoformat()
+async def get_stats() -> dict:
     async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        today = date.today().isoformat()
+
+        async with db.execute("SELECT COUNT(*) as cnt FROM users") as cur:
+            total = (await cur.fetchone())["cnt"]
+
         async with db.execute(
-            "SELECT COUNT(*) FROM users WHERE is_subscribed = 1 AND sub_expires_at > ?",
-            (now,),
-        ) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else 0
+            "SELECT COUNT(*) as cnt FROM users WHERE DATE(created_at) = ?", (today,)
+        ) as cur:
+            today_users = (await cur.fetchone())["cnt"]
 
-
-async def get_checks_today() -> int:
-    today = date.today().isoformat()
-    async with aiosqlite.connect(DATABASE_PATH) as db:
         async with db.execute(
-            "SELECT COALESCE(SUM(checks_today), 0) FROM users WHERE last_check_date = ?",
-            (today,),
-        ) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else 0
+            "SELECT COUNT(*) as cnt FROM users WHERE is_subscribed = 1 AND sub_expires_at > datetime('now')"
+        ) as cur:
+            active_subs = (await cur.fetchone())["cnt"]
 
-
-async def get_total_sales() -> int:
-    async with aiosqlite.connect(DATABASE_PATH) as db:
         async with db.execute(
-            "SELECT COUNT(*) FROM payments"
-        ) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else 0
+            "SELECT COALESCE(SUM(checks_today), 0) as cnt FROM users WHERE last_check_date = ?", (today,)
+        ) as cur:
+            checks_today = (await cur.fetchone())["cnt"]
+
+        async with db.execute("SELECT COUNT(*) as cnt FROM payments") as cur:
+            total_sales = (await cur.fetchone())["cnt"]
+
+        return {
+            "total": total,
+            "today": today_users,
+            "subs": active_subs,
+            "checks": checks_today,
+            "sales": total_sales,
+        }
 
 
 async def get_all_user_ids() -> list[int]:
     async with aiosqlite.connect(DATABASE_PATH) as db:
-        async with db.execute("SELECT user_id FROM users") as cursor:
-            rows = await cursor.fetchall()
+        async with db.execute("SELECT user_id FROM users") as cur:
+            rows = await cur.fetchall()
             return [row[0] for row in rows]
 
 
-async def get_subscribers_list() -> list[dict]:
-    now = datetime.now().isoformat()
+async def get_active_subscribers() -> list[dict]:
     async with aiosqlite.connect(DATABASE_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("""
             SELECT user_id, username, first_name, sub_expires_at
             FROM users
-            WHERE is_subscribed = 1 AND sub_expires_at > ?
+            WHERE is_subscribed = 1 AND sub_expires_at > datetime('now')
             ORDER BY sub_expires_at DESC
-        """, (now,)) as cursor:
-            rows = await cursor.fetchall()
-            return [dict(row) for row in rows]
+        """) as cur:
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
 
 
 async def get_stats_7_days() -> list[dict]:
-    """Статистика за последние 7 дней: новые пользователи и продажи по дням."""
     async with aiosqlite.connect(DATABASE_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("""
-            SELECT date(created_at) as day, COUNT(*) as count
-            FROM users
-            WHERE created_at >= date('now', '-7 days')
-            GROUP BY date(created_at)
-            ORDER BY day
-        """) as cursor:
-            users_rows = await cursor.fetchall()
-        async with db.execute("""
-            SELECT date(paid_at) as day, COUNT(*) as count, COALESCE(SUM(amount), 0) as revenue
+            SELECT
+                DATE(paid_at) as day,
+                COUNT(*) as sales,
+                SUM(amount) as revenue
             FROM payments
-            WHERE paid_at >= date('now', '-7 days')
-            GROUP BY date(paid_at)
-            ORDER BY day
-        """) as cursor:
-            payments_rows = await cursor.fetchall()
-
-    users_by_day = {r["day"]: r["count"] for r in users_rows}
-    payments_by_day = {r["day"]: (r["count"], r["revenue"]) for r in payments_rows}
-
-    result = []
-    for i in range(6, -1, -1):
-        day = (date.today() - timedelta(days=i)).isoformat()
-        p_count, p_revenue = payments_by_day.get(day, (0, 0))
-        result.append({
-            "day": day,
-            "new_users": users_by_day.get(day, 0),
-            "sales": p_count,
-            "revenue": p_revenue,
-        })
-    return result
+            WHERE paid_at >= datetime('now', '-7 days')
+            GROUP BY DATE(paid_at)
+            ORDER BY day DESC
+        """) as cur:
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
