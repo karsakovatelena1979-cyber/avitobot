@@ -1,24 +1,23 @@
-"""Запросы к OpenRouter (совместим с OpenAI SDK).
+"""Запросы к OpenRouter с fallback между моделями."""
 
-Модель: google/gemini-2.0-flash-exp:free
-Отправляет текст объявления + фото (base64) и получает вердикт.
-"""
-
-import base64
 import logging
 
-from openai import AsyncOpenAI
+import httpx
 
 from config import (
     AI_MAX_TOKENS,
-    AI_TIMEOUT,
     OPENROUTER_API_KEY,
     OPENROUTER_BASE_URL,
-    OPENROUTER_MODEL,
 )
 from utils.parser import AvitoListing
 
 logger = logging.getLogger(__name__)
+
+VISION_MODELS = [
+    "qwen/qwen-2.5-vl-72b-instruct:free",
+    "nvidia/nemotron-nano-12b-v2-vl:free",
+    "google/gemini-2.0-flash-exp:free",
+]
 
 PROMPT_TEMPLATE = """Ты эксперт по оценке объявлений на Авито. Проанализируй это объявление и дай честный вердикт.
 
@@ -29,8 +28,6 @@ PROMPT_TEMPLATE = """Ты эксперт по оценке объявлений 
 Состояние: {condition}
 Категория: {category}
 
-Фото прилагаются.
-
 Ответь строго в формате:
 ВЕРДИКТ: [БРАТЬ / ОСТОРОЖНО / БЕЖАТЬ]
 ПРИЧИНА: [2-3 предложения почему]
@@ -39,65 +36,65 @@ PROMPT_TEMPLATE = """Ты эксперт по оценке объявлений 
 
 
 class AIError(Exception):
-    """Ошибка при обращении к AI."""
     pass
 
 
-def _build_prompt(listing: AvitoListing) -> str:
-    return PROMPT_TEMPLATE.format(
+def _build_messages(listing: AvitoListing) -> list:
+    prompt = PROMPT_TEMPLATE.format(
         title=listing.title or "не указано",
         price=listing.price or "не указана",
-        description=listing.description[:2000] or "нет описания",
+        description=(listing.description or "нет описания")[:2000],
         condition=listing.condition or "не указано",
         category=listing.category or "не указана",
     )
-
-
-def _build_image_content(photos_base64: list[str]) -> list[dict]:
-    """Формирует content-блоки с изображениями для API."""
-    content = []
-    for b64 in photos_base64:
+    content = [{"type": "text", "text": prompt}]
+    for b64 in listing.photos_base64[:3]:
         content.append({
             "type": "image_url",
-            "image_url": {
-                "url": f"data:image/jpeg;base64,{b64}",
-            },
+            "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
         })
-    return content
+    return [{"role": "user", "content": content}]
 
 
 async def analyze_listing(listing: AvitoListing) -> str:
-    """Отправляет объявление в AI и возвращает вердикт (текст)."""
-    client = AsyncOpenAI(
-        api_key=OPENROUTER_API_KEY,
-        base_url=OPENROUTER_BASE_URL,
-        timeout=AI_TIMEOUT,
-    )
+    messages = _build_messages(listing)
+    last_error = None
 
-    prompt = _build_prompt(listing)
-    image_content = _build_image_content(listing.photos_base64)
+    for model in VISION_MODELS:
+        try:
+            logger.info("Пробуем модель: %s", model)
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.post(
+                    f"{OPENROUTER_BASE_URL}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                        "Content-Type": "application/json",
+                        "HTTP-Referer": "https://t.me/Radar_Avito_Bot",
+                        "X-Title": "Avito Radar Bot",
+                    },
+                    json={
+                        "model": model,
+                        "messages": messages,
+                        "max_tokens": AI_MAX_TOKENS,
+                    },
+                )
+                if resp.status_code == 429:
+                    logger.warning("Лимит модели %s", model)
+                    last_error = f"429 от {model}"
+                    continue
+                if resp.status_code != 200:
+                    last_error = f"HTTP {resp.status_code} от {model}: {resp.text[:200]}"
+                    continue
+                data = resp.json()
+                verdict = data["choices"][0]["message"]["content"]
+                if not verdict or len(verdict) < 10:
+                    last_error = f"Пустой ответ от {model}"
+                    continue
+                logger.info("Успех! Модель %s, %d символов", model, len(verdict))
+                return verdict
+        except Exception as e:
+            logger.warning("Ошибка %s: %s", model, e)
+            last_error = str(e)
+            continue
 
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                *image_content,
-            ],
-        }
-    ]
-
-    try:
-        response = await client.chat.completions.create(
-            model=OPENROUTER_MODEL,
-            messages=messages,
-            max_tokens=AI_MAX_TOKENS,
-        )
-        verdict = response.choices[0].message.content
-        if not verdict:
-            raise AIError("Пустой ответ от AI")
-        logger.info("AI вердикт получен (%d символов)", len(verdict))
-        return verdict
-    except Exception as e:
-        logger.error("Ошибка AI: %s", e)
-        raise AIError(str(e)) from e
+    raise AIError(f"Все модели недоступны. Последняя ошибка: {last_error}")

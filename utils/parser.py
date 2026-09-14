@@ -4,7 +4,6 @@ import asyncio
 import base64
 import json
 import logging
-import random
 import re
 from dataclasses import dataclass, field
 from urllib.parse import urlparse, urlunparse, urlencode
@@ -46,17 +45,18 @@ def _clean_url(url: str) -> str:
     return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
 
 
-def _scraper_url(target_url: str) -> str:
-    params = urlencode({
+def _scraper_url(target_url: str, premium: bool = False) -> str:
+    params = {
         "api_key": SCRAPER_API_KEY,
         "url": target_url,
         "country_code": "ru",
         "device_type": "desktop",
-        "keep_headers": "true",
         "render": "true",
-        "premium": "true",
-    })
-    return f"https://api.scraperapi.com/?{params}"
+        "keep_headers": "true",
+    }
+    if premium:
+        params["ultra_premium"] = "true"
+    return f"https://api.scraperapi.com/?{urlencode(params)}"
 
 
 async def _download_photo(url: str) -> str | None:
@@ -132,42 +132,64 @@ def _parse_html(soup: BeautifulSoup, url: str) -> AvitoListing:
     return listing
 
 
+async def _fetch_with_scraper(url: str, premium: bool = False) -> httpx.Response:
+    scraper_url = _scraper_url(url, premium=premium)
+    async with httpx.AsyncClient(timeout=90, follow_redirects=True) as client:
+        return await client.get(scraper_url)
+
+
 async def parse_avito(url: str) -> AvitoListing:
     clean_url = _clean_url(url)
-    scraper_url = _scraper_url(clean_url)
-    logger.info("Запрос через ScraperAPI: %s", clean_url)
 
-    try:
-        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
-            resp = await client.get(scraper_url)
+    # Попытка 1: обычный ScraperAPI с render
+    # Попытка 2: ultra_premium если капча
+    for attempt, premium in enumerate([(False), (True)], 1):
+        logger.info("Попытка %d, premium=%s", attempt, premium)
+        try:
+            resp = await _fetch_with_scraper(clean_url, premium=premium)
 
             if resp.status_code == 404:
-                raise AvitoNotFoundError("404 Not Found")
+                raise AvitoNotFoundError("404")
             if resp.status_code != 200:
                 raise AvitoBlockedError(f"ScraperAPI вернул {resp.status_code}")
 
             soup = BeautifulSoup(resp.text, "lxml")
+            is_captcha = (
+                "captcha" in resp.text.lower() and "Подтвердите" in resp.text
+            ) or "robot" in resp.text.lower()
 
-            if "captcha" in resp.text.lower() and "Подтвердите" in resp.text:
-                raise AvitoBlockedError("Капча даже через ScraperAPI")
+            if is_captcha and not premium:
+                logger.warning("Капча на попытке %d, пробуем ultra_premium", attempt)
+                continue
+
+            if is_captcha and premium:
+                raise AvitoBlockedError("Капча даже с ultra_premium")
 
             listing = _parse_html(soup, url)
 
             if not listing.title:
-                logger.error("Пустой заголовок, html: %s", resp.text[:500])
-                raise AvitoBlockedError("Не удалось распарсить страницу")
+                if not premium:
+                    logger.warning("Пустой заголовок, пробуем premium")
+                    continue
+                raise AvitoBlockedError("Не удалось распарсить даже с premium")
 
             for photo_url in listing.photos:
                 b64 = await _download_photo(photo_url)
                 if b64:
                     listing.photos_base64.append(b64)
 
-            logger.info("Парсинг OK: %s | %s | фото: %d",
+            logger.info("OK: %s | %s | фото: %d",
                        listing.title[:40], listing.price, len(listing.photos_base64))
             return listing
 
-    except (AvitoBlockedError, AvitoNotFoundError):
-        raise
-    except Exception as e:
-        logger.exception("Ошибка ScraperAPI: %s", e)
-        raise AvitoBlockedError(str(e)) from e
+        except (AvitoBlockedError, AvitoNotFoundError):
+            if premium:
+                raise
+            continue
+        except Exception as e:
+            if premium:
+                raise AvitoBlockedError(str(e)) from e
+            logger.warning("Ошибка попытки %d: %s", attempt, e)
+            continue
+
+    raise AvitoBlockedError("Все попытки исчерпаны")
