@@ -12,7 +12,7 @@ DATABASE_PATH: str = os.getenv("DATABASE_PATH", "/data/bot.db")
 # OpenRouter
 OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
-OPENROUTER_MODEL: str = "google/gemini-2.0-flash-exp:free"
+OPENROUTER_MODEL: str = "openrouter/free"
 
 # ScraperAPI
 SCRAPER_API_KEY: str = os.getenv("SCRAPER_API_KEY", "")
