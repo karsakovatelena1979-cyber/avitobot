@@ -132,7 +132,7 @@ def _fetch_sync(url: str, proxy: str) -> cf_requests.Response:
     return cf_requests.get(
         url,
         impersonate="chrome120",
-        proxies={"http": proxy, "https": proxy},
+        proxies={"https": proxy},
         timeout=30,
         headers={
             "Accept-Language": "ru-RU,ru;q=0.9",
