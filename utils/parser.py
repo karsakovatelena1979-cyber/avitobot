@@ -1,19 +1,39 @@
-"""Парсинг Авито через ScraperAPI."""
+"""Парсинг Авито через curl_cffi + резидентные прокси Webshare."""
 
 import asyncio
 import base64
 import json
 import logging
+import random
 import re
 from dataclasses import dataclass, field
-from urllib.parse import urlparse, urlunparse, urlencode
+from urllib.parse import urlparse, urlunparse
 
-import httpx
+from curl_cffi import requests as cf_requests
 from bs4 import BeautifulSoup
 
-from config import MAX_PHOTOS, PARSER_TIMEOUT, SCRAPER_API_KEY
+from config import MAX_PHOTOS, PARSER_TIMEOUT
 
 logger = logging.getLogger(__name__)
+
+PROXIES = [
+    "31.59.20.176:6754:eugfttlg:vtxc4mbymjp0",
+    "45.38.107.97:6014:eugfttlg:vtxc4mbymjp0",
+    "198.105.121.200:6462:eugfttlg:vtxc4mbymjp0",
+    "64.137.96.74:6641:eugfttlg:vtxc4mbymjp0",
+    "198.23.243.226:6361:eugfttlg:vtxc4mbymjp0",
+    "38.154.185.97:6370:eugfttlg:vtxc4mbymjp0",
+    "84.247.60.125:6095:eugfttlg:vtxc4mbymjp0",
+    "142.111.67.146:5611:eugfttlg:vtxc4mbymjp0",
+    "191.96.254.138:6185:eugfttlg:vtxc4mbymjp0",
+    "31.58.9.4:6077:eugfttlg:vtxc4mbymjp0",
+]
+
+
+def _get_proxy_url() -> str:
+    p = random.choice(PROXIES)
+    host, port, user, pwd = p.split(":")
+    return f"http://{user}:{pwd}@{host}:{port}"
 
 
 class AvitoBlockedError(Exception):
@@ -45,32 +65,8 @@ def _clean_url(url: str) -> str:
     return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
 
 
-def _scraper_url(target_url: str, premium: bool = False) -> str:
-    params = {
-        "api_key": SCRAPER_API_KEY,
-        "url": target_url,
-        "country_code": "ru",
-        "device_type": "desktop",
-        "render": "true",
-        "keep_headers": "true",
-    }
-    if premium:
-        params["ultra_premium"] = "true"
-    return f"https://api.scraperapi.com/?{urlencode(params)}"
-
-
-async def _download_photo(url: str) -> str | None:
-    try:
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            return base64.b64encode(resp.content).decode("utf-8")
-    except Exception as e:
-        logger.warning("Фото не скачалось: %s", e)
-        return None
-
-
-def _parse_html(soup: BeautifulSoup, url: str) -> AvitoListing:
+def _parse_html(html: str, url: str) -> AvitoListing:
+    soup = BeautifulSoup(html, "lxml")
     listing = AvitoListing(url=url)
 
     title_tag = (
@@ -132,49 +128,70 @@ def _parse_html(soup: BeautifulSoup, url: str) -> AvitoListing:
     return listing
 
 
-async def _fetch_with_scraper(url: str, premium: bool = False) -> httpx.Response:
-    scraper_url = _scraper_url(url, premium=premium)
-    async with httpx.AsyncClient(timeout=90, follow_redirects=True) as client:
-        return await client.get(scraper_url)
+def _fetch_sync(url: str, proxy: str) -> cf_requests.Response:
+    return cf_requests.get(
+        url,
+        impersonate="chrome120",
+        proxies={"http": proxy, "https": proxy},
+        timeout=30,
+        headers={
+            "Accept-Language": "ru-RU,ru;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Referer": "https://www.avito.ru/",
+        },
+    )
+
+
+def _fetch_photo_sync(url: str) -> str | None:
+    try:
+        resp = cf_requests.get(url, impersonate="chrome120", timeout=10)
+        resp.raise_for_status()
+        return base64.b64encode(resp.content).decode("utf-8")
+    except Exception as e:
+        logger.warning("Фото не скачалось: %s", e)
+        return None
 
 
 async def parse_avito(url: str) -> AvitoListing:
     clean_url = _clean_url(url)
+    last_error = None
 
-    # Попытка 1: обычный ScraperAPI с render
-    # Попытка 2: ultra_premium если капча
-    for attempt, premium in enumerate([(False), (True)], 1):
-        logger.info("Попытка %d, premium=%s", attempt, premium)
+    for attempt in range(1, 4):
+        proxy = _get_proxy_url()
+        logger.info("Попытка %d, прокси: %s", attempt, proxy.split("@")[1])
+        await asyncio.sleep(random.uniform(1, 3))
+
         try:
-            resp = await _fetch_with_scraper(clean_url, premium=premium)
+            loop = asyncio.get_event_loop()
+            resp = await loop.run_in_executor(None, _fetch_sync, clean_url, proxy)
 
             if resp.status_code == 404:
                 raise AvitoNotFoundError("404")
-            if resp.status_code != 200:
-                raise AvitoBlockedError(f"ScraperAPI вернул {resp.status_code}")
 
-            soup = BeautifulSoup(resp.text, "lxml")
-            is_captcha = (
-                "captcha" in resp.text.lower() and "Подтвердите" in resp.text
-            ) or "robot" in resp.text.lower()
-
-            if is_captcha and not premium:
-                logger.warning("Капча на попытке %d, пробуем ultra_premium", attempt)
+            if resp.status_code in (403, 429):
+                logger.warning("Статус %d на попытке %d", resp.status_code, attempt)
+                last_error = f"Статус {resp.status_code}"
                 continue
 
-            if is_captcha and premium:
-                raise AvitoBlockedError("Капча даже с ultra_premium")
+            if resp.status_code != 200:
+                last_error = f"HTTP {resp.status_code}"
+                continue
 
-            listing = _parse_html(soup, url)
+            html = resp.text
+            if "captcha" in html.lower() and "Подтвердите" in html:
+                logger.warning("Капча на попытке %d", attempt)
+                last_error = "капча"
+                continue
+
+            listing = _parse_html(html, url)
 
             if not listing.title:
-                if not premium:
-                    logger.warning("Пустой заголовок, пробуем premium")
-                    continue
-                raise AvitoBlockedError("Не удалось распарсить даже с premium")
+                logger.warning("Пустой заголовок на попытке %d", attempt)
+                last_error = "пустой заголовок"
+                continue
 
             for photo_url in listing.photos:
-                b64 = await _download_photo(photo_url)
+                b64 = await loop.run_in_executor(None, _fetch_photo_sync, photo_url)
                 if b64:
                     listing.photos_base64.append(b64)
 
@@ -182,14 +199,13 @@ async def parse_avito(url: str) -> AvitoListing:
                        listing.title[:40], listing.price, len(listing.photos_base64))
             return listing
 
-        except (AvitoBlockedError, AvitoNotFoundError):
-            if premium:
-                raise
-            continue
+        except AvitoNotFoundError:
+            raise
+        except AvitoBlockedError:
+            raise
         except Exception as e:
-            if premium:
-                raise AvitoBlockedError(str(e)) from e
             logger.warning("Ошибка попытки %d: %s", attempt, e)
+            last_error = str(e)
             continue
 
-    raise AvitoBlockedError("Все попытки исчерпаны")
+    raise AvitoBlockedError(f"Не удалось после 3 попыток. Причина: {last_error}")
